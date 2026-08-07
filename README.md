@@ -46,27 +46,21 @@ over the obvious alternative — are the substance below.
 
 ## 🧭 Architecture
 
-```
-                       +--------------------------------+
-                       |          AWatercraft           |  Pawn — owns rigid body + control state
-                       |     (base class, extensible)   |
-                       +---------------+----------------+
-                                       |
-        +------------------------------+------------------------------+
-        |                              |                              |
-+-------v---------+          +---------v----------+         +---------v----------+
-| WatercraftPhysics|         |   ControlComponent |         |  RiderSyncComponent|
-|   Component      |         |  rudder/gears/mode |         |  moving-base player |
-|  fixed substep   |         |                    |         |  sync + prediction  |
-+-------+----------+         +--------------------+         +--------------------+
-        | drives
-+-------v----------+  strategy (interface)
-| IBuoyancyStrategy|-------------------------------+
-+------------------+                               |
-        |  consumes                    +-----------v-----------+   +----------------------+
-        v                              | FSamplePointBuoyancy  |   |   FVolumeBuoyancy     |
- SampleWaterHeight(pos)  <- engine     |  cheap · stable       |   | accurate · volume+CoB |
-                                       +-----------------------+   +----------------------+
+```mermaid
+flowchart TD
+    Craft["<b>AWatercraft</b><br/>Pawn · rigid body + control state"]
+    Craft --> Phys["<b>WatercraftPhysicsComponent</b><br/>fixed-substep physics"]
+    Craft --> Ctrl["<b>ControlComponent</b><br/>rudder · gears · drive mode"]
+    Craft --> Sync["<b>RiderSyncComponent</b><br/>moving-base player sync + prediction"]
+    Phys -->|drives| IBuoy{{"IBuoyancyStrategy<br/>(interface)"}}
+    IBuoy --> Sample["FSamplePointBuoyancy<br/>cheap · stable"]
+    IBuoy --> Volume["FVolumeBuoyancy<br/>accurate · volume + CoB"]
+    IBuoy -. consumes .-> Ocean[("SampleWaterHeight()<br/>engine ocean")]
+
+    classDef iface fill:#1f6feb22,stroke:#1f6feb,stroke-width:1px;
+    classDef engine fill:#6f42c122,stroke:#6f42c1,stroke-width:1px;
+    class IBuoy iface;
+    class Ocean engine;
 ```
 
 **Design rules I held to:**
