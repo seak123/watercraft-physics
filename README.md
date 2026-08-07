@@ -1,247 +1,221 @@
-# Watercraft Physics & Multiplayer Sync
+# Watercraft Physics — Buoyancy & Multiplayer Sailing
 
-A reference design for **player-built, physically-simulated watercraft** in an open-world
-multiplayer game: how a craft floats and reacts to waves, how it stays frame-rate
-independent, and how multiple players standing and walking on a *moving, rotating*
-platform stay perfectly in sync across the network.
+> 开放世界里"玩家自建、真实物理漂浮"的船只系统的技术参照实现：两种浮力解法、帧率无关的定步长物理、以及**移动平台上多名玩家的网络同步**。
+>
+> A reference implementation of the physics and networking behind **player-built, physically-simulated watercraft** in an open-world multiplayer game — two buoyancy solutions, frame-rate-independent fixed-substep integration, and synchronization of **multiple players moving on a moving, rotating platform**.
 
-> **About this repository.** This is an original *clean-room* write-up of techniques I
-> designed and shipped as the owner of a watercraft system in a commercial title. It
-> contains **no proprietary source** — the code below is illustrative reference code I
-> wrote to explain the approach and the engineering trade-offs I made. The engine's ocean
-> *rendering* and *water-height sampling* are assumed as given (`SampleWaterHeight(pos)`);
-> everything else — framework, buoyancy, controls, and networking — is the subject here.
-
----
-
-## 1. Problem
-
-A watercraft in this game is not a scripted animation — it is a rigid body floating on a
-wave field, that:
-
-- must **feel good** (stable, weighty, responsive) rather than floaty or twitchy,
-- must behave **identically regardless of frame rate** (mobile 30fps vs 120fps),
-- carries **multiple players** who move around freely on the deck, and
-- must stay **consistent for every client** with bandwidth kept under control.
-
-The three hard sub-problems, and the design for each, follow.
+<p align="left">
+  <img alt="Created" src="https://img.shields.io/badge/created-2023-6f42c1">
+  <img alt="Engine" src="https://img.shields.io/badge/Unreal_Engine-C%2B%2B-0E1128?logo=unrealengine">
+  <img alt="Domain" src="https://img.shields.io/badge/domain-rigid_body_physics_%7C_netcode-1f6feb">
+  <img alt="Type" src="https://img.shields.io/badge/type-reference_implementation-orange">
+</p>
 
 ---
 
-## 2. Architecture
+## 📌 Context
+
+This distills work I owned in a shipped commercial title, where I was responsible for the
+watercraft system: the framework, buoyancy and water physics, piloting, and all of the
+multiplayer synchronization. The engine supplied only the ocean's surface *rendering* and a
+water-height query (`SampleWaterHeight(pos)`); everything documented here sits on top of that.
+
+> **This repository is a clean-room reference.** The code illustrates the architecture and the
+> techniques — it is original, written for portfolio purposes, and contains **no proprietary
+> or third-party source**. It is deliberately reduced to the load-bearing ideas rather than a
+> full engine integration.
+
+---
+
+## 🎯 The problem, precisely
+
+A watercraft here is not a scripted platform — it is a **rigid body floating on a wave field**
+that must satisfy four constraints simultaneously:
+
+| Constraint | Why it's hard |
+|---|---|
+| **Feels good** | Must read as weighty and stable, not floaty or twitchy — a tuning-sensitive, subjective target. |
+| **Frame-rate independent** | Identical behaviour from 30 fps mobile to 120 fps desktop; force integration is sensitive to `dt`. |
+| **Carries multiple players** | Players stand and *walk around* on a base that is itself translating and rotating. |
+| **Network-consistent & cheap** | Every client must agree on the boat *and* everyone on it, in real time, without saturating the channel. |
+
+The three engineering decisions that resolve these — and, importantly, *why* each was chosen
+over the obvious alternative — are the substance below.
+
+---
+
+## 🧭 Architecture
 
 ```
-                +-----------------------------+
-                |        AWatercraft          |   Pawn; owns rigid body + control state
-                |  (base class, extensible)   |
-                +--------------+--------------+
-                               |
-        +----------------------+----------------------+
-        |                      |                      |
-+-------v--------+   +---------v---------+   +---------v---------+
-| BuoyancyComp   |   |  ControlComp      |   |  NetSyncComp      |
-| substep physics|   |  rudder / gears / |   |  movement replic. |
-| 2 buoyancy     |   |  drive modes      |   |  + moving-base    |
-| strategies     |   |                   |   |  player sync      |
-+----------------+   +-------------------+   +-------------------+
-        |
-        | consumes
-        v
-  SampleWaterHeight(worldPos)   <- provided by engine ocean
+                       +--------------------------------+
+                       |          AWatercraft           |  Pawn — owns rigid body + control state
+                       |     (base class, extensible)   |
+                       +---------------+----------------+
+                                       |
+        +------------------------------+------------------------------+
+        |                              |                              |
++-------v---------+          +---------v----------+         +---------v----------+
+| WatercraftPhysics|         |   ControlComponent |         |  RiderSyncComponent|
+|   Component      |         |  rudder/gears/mode |         |  moving-base player |
+|  fixed substep   |         |                    |         |  sync + prediction  |
++-------+----------+         +--------------------+         +--------------------+
+        | drives
++-------v----------+  strategy (interface)
+| IBuoyancyStrategy|-------------------------------+
++------------------+                               |
+        |  consumes                    +-----------v-----------+   +----------------------+
+        v                              | FSamplePointBuoyancy  |   |   FVolumeBuoyancy     |
+ SampleWaterHeight(pos)  <- engine     |  cheap · stable       |   | accurate · volume+CoB |
+                                       +-----------------------+   +----------------------+
 ```
 
-Design rules I held to:
+**Design rules I held to:**
 
-- **One base craft, extended by composition.** A raft, a larger boat, or a new drive mode
-  are *extensions* — they reuse the same components and never fork the framework
-  (open/closed). New behaviour is a new component or a new strategy, not an edit to the core.
-- **Physics, control, and networking are separate components** (single responsibility) so I
-  can retune buoyancy without touching replication, and vice-versa.
-- **Buoyancy is a strategy behind one interface** — see §4 — so the rest of the craft neither
-  knows nor cares which of the two implementations is running.
+- **One base craft, extended by composition.** A raft, a larger vessel, or a new drive mode are
+  *extensions* that reuse the same components — never a fork of the framework (open/closed).
+- **Physics, control, and networking are separate components** (single responsibility), so
+  retuning buoyancy never risks the replication path, and vice-versa.
+- **Buoyancy is a strategy behind one interface**, so the rest of the craft is agnostic to which
+  of the two implementations is running — see the trade-off in §2.
 
 ---
 
-## 3. Frame-rate-independent physics (fixed substep)
+## 1. Frame-rate independence: fixed-substep integration
 
-The single most important correctness decision. Applying buoyancy/damping once per rendered
-frame makes the craft behave differently at 30fps and 120fps — it visibly bobs differently
-and, worse, desyncs between clients. I run the craft's physics on a **fixed-timestep
-accumulator**, decoupled from the render frame:
+**Decision.** Run the craft's physics on a fixed-timestep accumulator (60 Hz), decoupled from the
+render frame, instead of applying buoyancy once per rendered frame.
+
+**Why.** Per-frame force integration makes the craft behave differently at 30 fps and 120 fps —
+it visibly bobs differently, and, far worse, clients running at different frame rates cannot
+agree on the boat's height. That disagreement is fatal for the sync in §3. Fixing the timestep
+makes the simulation **deterministic with respect to frame time**, which is a *precondition* for
+stable networking, not merely a polish detail.
 
 ```cpp
-// Frame-rate independent integration. Physics always advances in fixed dt slices,
-// no matter how long the render frame was. Guarantees identical behaviour at any FPS.
-void UBuoyancyComponent::TickPhysics(float DeltaTime)
+// WatercraftPhysicsComponent.cpp — physics advances only in fixed dt slices.
+void UWatercraftPhysicsComponent::TickPhysics(float DeltaTime)
 {
-    constexpr float FixedStep = 1.0f / 60.0f;   // simulation runs at a stable 60 Hz
-    constexpr int   MaxSteps  = 5;              // clamp to avoid a spiral of death
-
     Accumulator += DeltaTime;
 
-    int Steps = 0;
-    while (Accumulator >= FixedStep && Steps < MaxSteps)
+    int32 Steps = 0;
+    while (Accumulator >= Val_FixedStep && Steps < Val_MaxSubsteps)  // 60 Hz slices
     {
-        IntegrateSubstep(FixedStep);            // buoyancy + damping + drag, once per slice
-        Accumulator -= FixedStep;
+        IntegrateSubstep(Val_FixedStep);
+        Accumulator -= Val_FixedStep;
         ++Steps;
     }
-
-    if (Steps == MaxSteps)                       // we fell behind: drop the backlog
-        Accumulator = 0.0f;
+    if (Steps >= Val_MaxSubsteps) Accumulator = 0.0f;   // fell behind: drop backlog, no death spiral
 }
 ```
 
-**Why this mattered in practice:** before this, the raft literally rode the waves
-differently on different devices and clients could not agree on its height. Substepping made
-the simulation deterministic w.r.t. frame time, which is also a *precondition* for the
-network sync in §5 to be stable.
+See [`src/WatercraftPhysicsComponent.cpp`](src/WatercraftPhysicsComponent.cpp).
 
 ---
 
-## 4. Buoyancy — two strategies, one interface
+## 2. Buoyancy: two strategies behind one interface
 
-I shipped **two** buoyancy implementations behind a common interface, so each craft can trade
-**accuracy against cost**. Both consume the same `SampleWaterHeight()` and apply forces
-inside the fixed substep from §3.
+**Decision.** Ship **two** buoyancy implementations behind [`IBuoyancyStrategy`](src/BuoyancyStrategy.h),
+selectable per craft, rather than committing to a single model.
 
-```cpp
-// Common interface — the craft depends on this, not on a concrete strategy.
-class IBuoyancyStrategy
-{
-public:
-    virtual ~IBuoyancyStrategy() = default;
-    // Accumulate buoyant force/torque for this substep onto the rigid body.
-    virtual void ApplyBuoyancy(FRigidBodyState& Body, float SubstepDt) const = 0;
-};
-```
+**Why.** There is no single right answer — it's an accuracy-vs-cost curve, and different craft sit
+at different points on it. Forcing one model on the whole game means either paying volume-integration
+cost on a trivial raft, or accepting a starter raft's fidelity on a hero vessel. An interface makes
+the choice *data*, and keeps control/networking code oblivious to it.
 
-### 4a. Sample-point strategy — cheap and stable
-
-Place N probe points on the hull; each submerged probe pushes up proportional to how deep it
-is. O(N), no mesh work, extremely stable — the right default for simple craft like rafts.
+| Strategy | Method | Cost | Behaviour | Best for |
+|---|---|---|---|---|
+| `FSamplePointBuoyancy` | Per-probe force by submersion depth | O(N) probes, no mesh work | Very stable, approximate | Simple craft (rafts) |
+| `FVolumeBuoyancy` | Clip hull triangles, submerged volume + true center of buoyancy, Archimedes | O(triangles) | Realistic tilt & self-righting | Hero vessels |
 
 ```cpp
-void FSamplePointBuoyancy::ApplyBuoyancy(FRigidBodyState& Body, float SubstepDt) const
+// BuoyancyStrategy.cpp — accurate path: force = rho*g*V applied at the TRUE center of buoyancy.
+if (SubmergedVolume > KINDA_SMALL_NUMBER)
 {
-    for (const FVector& LocalProbe : Probes)
-    {
-        const FVector WorldProbe = Body.TransformPosition(LocalProbe);
-        const float   WaterZ     = SampleWaterHeight(WorldProbe);
-        const float   Depth      = WaterZ - WorldProbe.Z;      // >0 == submerged
-
-        if (Depth > 0.0f)
-        {
-            // Force grows with submersion depth, clamped so a probe can't launch the hull.
-            const float Force = FMath::Min(Depth * PerProbeStiffness, MaxProbeForce);
-            Body.AddForceAtPosition(FVector::UpVector * Force, WorldProbe);
-        }
-    }
-    ApplyLinearAndAngularDamping(Body, SubstepDt);            // kills endless bobbing
+    VolumeCentroid /= SubmergedVolume;                                    // true center of buoyancy
+    const float Force = Val_WaterDensity * Val_Gravity * SubmergedVolume; // Archimedes
+    Body.AddForceAtPosition(FVector::UpVector * Force, VolumeCentroid);
 }
 ```
 
-### 4b. Submerged-volume strategy — physically accurate
-
-For craft where realistic tilt/righting matters, I clip the hull's triangles against the
-water plane, compute the **actual submerged volume** and its **true center of buoyancy**, and
-apply Archimedes' force there. Heavier, but the craft leans into turns and self-rights
-believably.
-
-```cpp
-void FVolumeBuoyancy::ApplyBuoyancy(FRigidBodyState& Body, float SubstepDt) const
-{
-    float   SubmergedVolume = 0.0f;
-    FVector VolumeCentroid  = FVector::ZeroVector;
-
-    for (const FHullTriangle& Tri : Hull)
-    {
-        FVector v0 = Body.TransformPosition(Tri.A);
-        FVector v1 = Body.TransformPosition(Tri.B);
-        FVector v2 = Body.TransformPosition(Tri.C);
-
-        // Signed depths of each vertex below the (locally planar) water surface.
-        const float d0 = SampleWaterHeight(v0) - v0.Z;
-        const float d1 = SampleWaterHeight(v1) - v1.Z;
-        const float d2 = SampleWaterHeight(v2) - v2.Z;
-
-        // Clip the triangle to the underwater region and accumulate its prism volume
-        // and centroid contribution. Fully/partially submerged tris handled separately.
-        ClipAndAccumulate(v0, v1, v2, d0, d1, d2, SubmergedVolume, VolumeCentroid);
-    }
-
-    if (SubmergedVolume > KINDA_SMALL_NUMBER)
-    {
-        VolumeCentroid /= SubmergedVolume;                   // true center of buoyancy
-        const float Force = WaterDensity * Gravity * SubmergedVolume;   // Archimedes
-        Body.AddForceAtPosition(FVector::UpVector * Force, VolumeCentroid);
-        ApplyLinearAndAngularDamping(Body, SubstepDt);
-    }
-}
-```
-
-**The design decision that reads well:** having *both* behind `IBuoyancyStrategy` meant I was
-never boxed in — designers could pick "cheap and stable" for the starter raft and "accurate"
-for hero vessels, per craft, with zero change to control or networking code.
+The payoff: the same craft, control, and netcode drove *both* a cheap starter raft and a
+physically-accurate vessel with zero change outside the strategy.
 
 ---
 
-## 5. The hard one: syncing players on a moving platform
+## 3. The hard one: players on a moving platform
 
-A boat is a base that is itself moving and rotating; players walk around **on** it. If each
-player's world position is replicated naively, tiny disagreements about *where the boat is*
-compound with disagreements about *where the player is on it*, and you get jitter, rubber-
-banding, and players sliding off the deck on remote screens.
+**Decision.** Replicate each rider's motion in the **platform's local frame**, and layer
+**client-side prediction with reconciliation** on top — rather than replicating rider world
+positions directly.
 
-**Approach: replicate player motion in the platform's local frame, plus client prediction +
-reconciliation.**
+**Why.** A boat is a base that is itself moving and rotating. If a rider's *world* position is
+replicated naively, disagreements about *where the boat is* compound with disagreements about
+*where the rider is on it* — producing jitter, rubber-banding, and riders visibly sliding off the
+deck on remote screens. Storing the rider **relative to the boat** collapses the first error
+source: every client reconstructs `world = authoritativeBoatXform * localOffset`, so the rider is
+correct on deck by construction, independent of small boat-position disagreements.
 
 ```cpp
-// A rider's position is stored & replicated RELATIVE to the boat, not in world space.
-// Every client reconstructs world position from (authoritative boat transform) * (local).
-FVector UNetSyncComponent::ResolveRiderWorldPosition(const FRiderState& Rider) const
+// RiderSyncComponent — world position is reconstructed, never replicated directly.
+FVector URiderSyncComponent::ResolveRiderWorldPosition(const FRiderState& Rider) const
 {
     const FTransform BoatXform = GetBoatTransformForFrame(Rider.BaseFrameId);
-    return BoatXform.TransformPosition(Rider.LocalOffset);
+    return BoatXform.TransformPosition(Rider.LocalOffset);   // boat-local -> world
 }
 
-// Client predicts locally every frame for responsiveness, then reconciles when the
-// authoritative state for that input frame arrives — correcting only if it drifted.
-void UNetSyncComponent::OnServerRiderState(const FRiderState& Server)
+// Predict locally for responsiveness; reconcile only when authoritative state drifts past threshold.
+void URiderSyncComponent::OnServerRiderState(const FRiderState& Server)
 {
-    const FVector Predicted = PredictedHistory.Get(Server.BaseFrameId);
-    const float   Error     = FVector::Dist(Predicted, Server.LocalOffset);
-
-    if (Error > ReconcileThreshold)
+    const float Error = FVector::Dist(PredictedHistory.Get(Server.BaseFrameId), Server.LocalOffset);
+    if (Error > Val_ReconcileThreshold)
     {
-        LocalOffset = Server.LocalOffset;          // snap the base
-        ReplayPendingInputs(Server.BaseFrameId);   // re-apply unacked inputs on top
+        LocalOffset = Server.LocalOffset;             // snap the base
+        ReplayPendingInputs(Server.BaseFrameId);      // re-apply unacked inputs on top
     }
-    // else: prediction was good enough — smooth, no visible correction.
+    // else: prediction was good enough — no visible correction.
 }
 ```
 
-Bandwidth control that made it shippable on weak networks:
+**Bandwidth discipline that made it shippable on weak networks:**
 
-- Rider deltas are **quantized** and sent only when they exceed a movement threshold.
-- Boat transform updates are **rate-limited and prioritized**; on detected packet loss the
-  per-tick update budget shrinks so the channel degrades gracefully instead of collapsing.
-- Because physics is deterministic per substep (§3), clients can *predict* the boat between
-  updates, so I can send fewer of them without visible cost.
+- Rider deltas are **quantized** (`FVector_NetQuantize`) and sent only past a movement threshold.
+- Boat transform updates are **rate-limited and prioritized**; on detected packet loss the per-tick
+  update budget shrinks so the channel degrades gracefully instead of collapsing.
+- Because §1 made the boat deterministic per substep, clients **predict** it between updates — so
+  fewer updates are needed for the same visual quality.
+
+See [`src/RiderSyncComponent.h`](src/RiderSyncComponent.h).
 
 ---
 
-## 6. Results
+## 🗂️ Repository layout
 
-- Craft behave **identically across frame rates and devices** — the substep rewrite fixed a
-  whole class of "bobs differently on mobile" and cross-client height-disagreement bugs.
-- **Two buoyancy models** let the team dial realism-vs-performance per craft instead of being
-  stuck with one compromise.
-- Multiple players **sail together on one boat with no jitter or rubber-banding**, and it
-  holds up under packet loss — the part that usually breaks first in this genre.
+```
+watercraft-physics/
+├── README.md
+└── src/
+    ├── BuoyancyStrategy.h            Strategy interface + two implementations
+    ├── BuoyancyStrategy.cpp          Sample-point & submerged-volume (clip + centroid) math
+    ├── WatercraftPhysicsComponent.h  Fixed-substep driver (frame-rate independence)
+    ├── WatercraftPhysicsComponent.cpp
+    └── RiderSyncComponent.h          Moving-base rider sync: local-frame + prediction/reconcile
+```
 
-## 7. What this demonstrates
+The code is a **reduced reference** — the load-bearing algorithms and interfaces, with engine
+integration (physics backend, actual replication channel) abstracted behind small facades so the
+ideas read clearly.
 
-Ownership of a **physics-and-network-heavy** gameplay system end to end; comfort with rigid-
-body simulation, numerical stability, and multiplayer netcode; and the engineering judgment
-to build *two* solutions behind one interface when a single one wouldn't serve every case.
+---
+
+## 💡 What this demonstrates
+
+End-to-end ownership of a **physics- and network-heavy** gameplay system; comfort with rigid-body
+simulation, numerical stability, and multiplayer netcode; and the engineering judgment to build
+*two* solutions behind one interface, and to recognize that fixed-timestep determinism is what
+makes the networking tractable in the first place.
+
+## 📜 Notes
+
+Original reference code authored by me for portfolio purposes. No proprietary or third-party
+source is included; the engine facades (`FRigidBodyState`, `SampleWaterHeight`) are illustrative
+stand-ins for the real integration points.
