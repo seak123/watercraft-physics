@@ -104,6 +104,28 @@ driven. See [`src/RaftControlComponent.h`](src/RaftControlComponent.h).
 > This is the *control* layer that sits on top of the physics below — it produces the thrust and
 > steering forces that §1's fixed substep integrates each tick.
 
+### The wave field the physics actually reads
+
+The ocean's *rendering* is the engine's. But physics can't read back a rendered surface — it needs
+an **analytic, CPU-side wave field** evaluable at any point and time, that still matches the
+visuals, or the boat visibly floats off the water.
+
+- **Trochoidal (Gerstner) waves**, not plain sines — sharper crests, flatter troughs, which is
+  what real swell looks like; a `Sharpness` term controls exactly that.
+- **Tiled with cached corner depths**, bilinearly interpolated inside a tile: waves shrink toward
+  the shore and only reach full height in deep water.
+- **Several wave trains** of differing direction and wavelength are summed, driven by wind.
+
+```cpp
+// ！！！OceanTime 必须全局同步 / OceanTime MUST be globally synchronized — never each
+// client's own accumulated local time. Otherwise wave phase drifts apart between clients
+// and the same boat sits at different heights on each screen, which breaks the boat sync
+// in §3 that rests on everyone seeing the same water.
+float UOceanManager::SampleWaterHeight(const FVector& WorldPos) const;
+```
+
+See [`src/OceanWaveField.h`](src/OceanWaveField.h).
+
 ---
 
 ## 1. Frame-rate independence: fixed-substep integration
@@ -163,6 +185,20 @@ if (SubmergedVolume > KINDA_SMALL_NUMBER)
 }
 ```
 
+**Why sample points suffice for a raft:** a raft is essentially a flat slab, so four corner probes
+already express pitch and roll correctly — a corner sitting deeper gets pushed harder, and the
+craft self-levels. **What the volume method buys instead:** the centre of buoyancy *moves on its
+own*. As the hull heels, the submerged centroid shifts to that side, producing a genuine righting
+moment — banking in turns and self-righting emerge with no special-case code.
+
+Two details that separate "floats" from "feels right":
+
+- **Per-probe force is clamped.** Without a clamp, a corner plunging underwater launches the whole
+  craft out of the water.
+- **Damping is quadratic in velocity and scaled by submersion.** At low speed it barely intervenes
+  (the boat still rides the swell); at high speed it clamps down hard; and a craft out of the water
+  isn't dragged by water it isn't touching.
+
 The payoff: the same craft, control, and netcode drove *both* a cheap starter raft and a
 physically-accurate vessel with zero change outside the strategy.
 
@@ -221,6 +257,7 @@ watercraft-physics/
 ├── README.md
 └── src/
     ├── RaftControlComponent.h        Gameplay: boarding/helm, paddle vs sail, rudder, gears
+    ├── OceanWaveField.h              Gameplay/physics: trochoidal wave field, depth tiles, wind
     ├── BuoyancyStrategy.h            Strategy interface + two implementations
     ├── BuoyancyStrategy.cpp          Sample-point & submerged-volume (clip + centroid) math
     ├── WatercraftPhysicsComponent.h  Fixed-substep driver (frame-rate independence)
