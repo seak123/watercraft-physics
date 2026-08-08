@@ -15,10 +15,15 @@
 
 ## 📌 Context
 
-This distills work I owned in a shipped commercial title, where I was responsible for the
-watercraft system: the framework, buoyancy and water physics, piloting, and all of the
-multiplayer synchronization. The engine supplied only the ocean's surface *rendering* and a
-water-height query (`SampleWaterHeight(pos)`); everything documented here sits on top of that.
+This distills work I owned on **_Light of Motiram_** (Tencent, Unreal Engine · C++), where I was
+responsible for the watercraft system: the framework, buoyancy and water physics, piloting, and
+all of the multiplayer synchronization. The engine supplied only the ocean's surface *rendering*
+and a water-height query (`SampleWaterHeight(pos)`); everything documented here sits on top of that.
+
+> **Related systems I owned on the same title:** craft are assembled from building pieces, so this
+> connects directly to [data-oriented-building](https://github.com/seak123/data-oriented-building) —
+> and creatures automate production via
+> [automation-ai-productionline](https://github.com/seak123/automation-ai-productionline).
 
 > **This repository is a clean-room reference.** The code illustrates the architecture and the
 > techniques — it is original, written for portfolio purposes, and contains **no proprietary
