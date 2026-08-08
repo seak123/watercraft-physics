@@ -74,6 +74,38 @@ flowchart TD
 
 ---
 
+## 🎮 Gameplay: boarding, the helm, and sailing
+
+A raft is player-built and crewable. You board through a **boarding region**, and stepping into
+the **driver region** puts you at the helm. From there the moment-to-moment gameplay is:
+
+- **Two propulsion modes** — *manual paddle* (forward / back) for fine control in tight water, or
+  raise the **sail** (half / full) to catch the wind for real speed.
+- **Wind matters** — sail thrust is the wind's component along the heading, scaled by sail area,
+  so you trim your heading against the wind instead of driving in a straight line.
+- **Steer with the rudder** — the rudder value is replicated; steering authority scales with
+  speed (a drifting raft barely turns).
+- **Gears** — Back / Stop / Slow / Half / Full.
+
+```cpp
+// RaftControlComponent — sail thrust is wind projected onto the raft's forward axis, by sail area.
+FVector URaftControlComponent::ComputeSailForce(const FVector& Wind) const
+{
+    const FVector Forward = GetOwner()->GetActorForwardVector();
+    const float   Along   = FVector::DotProduct(Wind, Forward);   // tailwind vs headwind
+    return Forward * (Along * SailSize * Val_SailForceFactor);
+}
+```
+
+Inputs are client-predicted (`Client_*`) and server-authoritative (`Server_*`); the rudder value,
+drive mode, and sail size replicate to everyone, so all clients agree on how the boat is being
+driven. See [`src/RaftControlComponent.h`](src/RaftControlComponent.h).
+
+> This is the *control* layer that sits on top of the physics below — it produces the thrust and
+> steering forces that §1's fixed substep integrates each tick.
+
+---
+
 ## 1. Frame-rate independence: fixed-substep integration
 
 **Decision.** Run the craft's physics on a fixed-timestep accumulator (60 Hz), decoupled from the
@@ -188,6 +220,7 @@ See [`src/RiderSyncComponent.h`](src/RiderSyncComponent.h).
 watercraft-physics/
 ├── README.md
 └── src/
+    ├── RaftControlComponent.h        Gameplay: boarding/helm, paddle vs sail, rudder, gears
     ├── BuoyancyStrategy.h            Strategy interface + two implementations
     ├── BuoyancyStrategy.cpp          Sample-point & submerged-volume (clip + centroid) math
     ├── WatercraftPhysicsComponent.h  Fixed-substep driver (frame-rate independence)
